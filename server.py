@@ -1,18 +1,30 @@
 from datetime import datetime, timedelta
-import sqlite3
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import (Flask, jsonify, request, render_template_string,
                    redirect, url_for)
 
 app = Flask(__name__)
 
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL не задан в переменных окружения")
+
+
+def get_db():
+    """Открывает соединение с PostgreSQL (Neon)."""
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
 
 def init_db():
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("""
+    """Создаёт таблицу, если её нет."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
             hwid TEXT PRIMARY KEY,
-            expires_at TEXT
+            expires_at TIMESTAMP NOT NULL
         )
     """)
     conn.commit()
@@ -189,18 +201,17 @@ def check_license():
     if not hwid:
         return jsonify({"active": False, "error": "No HWID provided"}), 400
 
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT expires_at FROM licenses WHERE hwid = ?", (hwid,))
-    row = cursor.fetchone()
-    now = datetime.now()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT expires_at FROM licenses WHERE hwid = %s", (hwid,))
+    row = cur.fetchone()
+    conn.close()
 
     if not row:
-        conn.close()
         return jsonify({"active": False, "error": "Подписка неактивна"})
 
-    expires_at = datetime.fromisoformat(row[0])
-    conn.close()
+    expires_at = row["expires_at"]
+    now = datetime.now()
 
     if now < expires_at:
         return jsonify({"active": True, "expires_at": expires_at.isoformat()})
@@ -220,15 +231,15 @@ def admin_panel():
 
         if hwid:
             expires_at = datetime.now() + timedelta(days=days)
-            conn = sqlite3.connect("database.db")
-            cursor = conn.cursor()
-            cursor.execute(
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute(
                 """
                 INSERT INTO licenses (hwid, expires_at)
-                VALUES (?, ?)
-                ON CONFLICT(hwid) DO UPDATE SET expires_at=excluded.expires_at
+                VALUES (%s, %s)
+                ON CONFLICT (hwid) DO UPDATE SET expires_at = EXCLUDED.expires_at
                 """,
-                (hwid, expires_at.isoformat()),
+                (hwid, expires_at),
             )
             conn.commit()
             conn.close()
@@ -239,26 +250,20 @@ def admin_panel():
             ))
 
     # --- Список всех подписок ---
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT hwid, expires_at FROM licenses ORDER BY expires_at DESC")
-    rows = cursor.fetchall()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT hwid, expires_at FROM licenses ORDER BY expires_at DESC")
+    rows = cur.fetchall()
     conn.close()
 
     now = datetime.now()
     subs = []
-    for hwid, exp_iso in rows:
-        try:
-            exp = datetime.fromisoformat(exp_iso)
-            is_active = now < exp
-            exp_str = exp.strftime("%d.%m.%Y")
-        except Exception:
-            exp_str = "—"
-            is_active = False
+    for row in rows:
+        exp = row["expires_at"]
         subs.append({
-            "hwid": hwid,
-            "expires": exp_str,
-            "active": is_active,
+            "hwid": row["hwid"],
+            "expires": exp.strftime("%d.%m.%Y"),
+            "active": now < exp,
         })
 
     return render_template_string(
@@ -276,10 +281,10 @@ def admin_revoke():
     if not hwid:
         return redirect(url_for("admin_panel", msg="HWID не указан", type="err"))
 
-    conn = sqlite3.connect("database.db")
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM licenses WHERE hwid = ?", (hwid,))
-    deleted = cursor.rowcount
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM licenses WHERE hwid = %s", (hwid,))
+    deleted = cur.rowcount
     conn.commit()
     conn.close()
 
@@ -294,6 +299,11 @@ def admin_revoke():
         return redirect(url_for("admin_panel", msg="HWID не найден", type="err"))
 
 
+# ---- ВАЖНО: вызываем init_db() при импорте, а не только в __main__ ----
+# Render запускает приложение через gunicorn, а не через python server.py,
+# поэтому блок `if __name__ == "__main__"` не срабатывает.
+init_db()
+
+
 if __name__ == "__main__":
-    init_db()
     app.run(host="0.0.0.0", port=5000)
